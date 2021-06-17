@@ -16,13 +16,6 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include "../vsockexec/vsock.h"
-
-// musl-gcc doesn't use headers in /usr/include, so it can't find
-// linux/random.h which is where RNDADDENTROPY is defined. We only need this
-// single definition from linux/random.h, so we just duplicate it here as a
-// workaround.
-#define RNDADDENTROPY _IOW( 'R', 0x03, int [2] )
 
 #define DEFAULT_PATH_ENV "PATH=/sbin:/usr/sbin:/bin:/usr/bin"
 
@@ -31,9 +24,6 @@ const char *const default_envp[] = {
     NULL,
 };
 
-// When nothing is passed, default to the LCOWv1 behavior.
-const char *const default_argv[] = { "/bin/gcs", "-loglevel", "debug", "-logfile=/run/gcs/gcs.log" };
-const char *const default_shell = "/bin/sh";
 
 struct Mount {
     const char *source, *target, *type;
@@ -148,9 +138,9 @@ void init_dev() {
         // /dev will be already mounted if devtmpfs.mount = 1 on the kernel
         // command line or CONFIG_DEVTMPFS_MOUNT is set. Do not consider this
         // an error.
-        if (errno != EBUSY) {
-            dien();
-        }
+        //if (errno != EBUSY) {
+        //    dien();
+        //}
     }
 }
 
@@ -160,7 +150,10 @@ void init_fs(const struct InitOp *ops, size_t count) {
         case OpMount: {
             const struct Mount *m = &ops[i].mount;
             if (mount(m->source, m->target, m->type, m->flags, m->data) < 0) {
-                die2("mount", m->target);
+            	warn2("mount", m->target);
+	    	//if (errno != EBUSY) {	
+		//    die2("mount", m->target);
+		//}
             }
             break;
         }
@@ -260,153 +253,27 @@ void init_network(const char *iface, int domain) {
     close(s);
 }
 
-// inject boot-time entropy after reading it from a vsock port
-void init_entropy(int port) {
-    int s = openvsock(VMADDR_CID_HOST, port);
-    if (s < 0) {
-        die("openvsock entropy");
-    }
-
-    int e = open("/dev/random", O_RDWR);
-    if (e < 0) {
-        die("open /dev/random");
-    }
-
-    struct {
-        int entropy_count;
-        int buf_size;
-        char buf[4096];
-    } buf;
-
-    for (;;) {
-        ssize_t n = read(s, buf.buf, sizeof(buf.buf));
-        if (n < 0) {
-            die("read entropy");
-        }
-
-        if (n == 0) {
-            break;
-        }
-
-        buf.entropy_count = n * 8; // in bits
-        buf.buf_size = n; // in bytes
-        if (ioctl(e, RNDADDENTROPY, &buf) < 0) {
-            die("ioctl(RNDADDENTROPY)");
-        }
-    }
-
-    close(s);
-    close(e);
-}
-
-pid_t launch(int argc, char **argv) {
-    int pid = fork();
-    if (pid != 0) {
-        if (pid < 0) {
-            die("fork");
-        }
-
-        return pid;
-    }
-
-    // Unblock signals before execing.
-    sigset_t set;
-    sigfillset(&set);
-    sigprocmask(SIG_UNBLOCK, &set, 0);
-
-    // Create a session and process group.
-    setsid();
-    setpgid(0, 0);
-
-    // Terminate the arguments and exec.
-    char **argvn = alloca(sizeof(argv[0]) * (argc + 1));
-    memcpy(argvn, argv, sizeof(argv[0]) * argc);
-    argvn[argc] = NULL;
-    if (putenv(DEFAULT_PATH_ENV)) { // Specify the PATH used for execvpe
-        die("putenv");
-    }
-    execvpe(argvn[0], argvn, (char**)default_envp);
-    die2("execvpe", argvn[0]);
-}
-
-int reap_until(pid_t until_pid) {
-    for (;;) {
-        int status;
-        pid_t pid = wait(&status);
-        if (pid < 0) {
-            die("wait");
-        }
-
-        if (pid == until_pid) {
-            // The initial child process died. Pass through the exit status.
-            if (WIFEXITED(status)) {
-                if (WEXITSTATUS(status) != 0) {
-                    fputs("child exited with error\n", stderr);
-                }
-                return WEXITSTATUS(status);
-            }
-            fputs("child exited by signal: ", stderr);
-            fputs(strsignal(WTERMSIG(status)), stderr);
-            fputs("\n", stderr);
-            return 128 + WTERMSIG(status);
-        }
-    }
-}
-
 int main(int argc, char **argv) {
-    char *debug_shell = NULL;
-    int entropy_port = 0;
-    if (argc <= 1) {
-        argv = (char **)default_argv;
-        argc = sizeof(default_argv) / sizeof(default_argv[0]);
-        optind = 0;
-        debug_shell = (char*)default_shell;
-    } else {
-        for (int opt; (opt = getopt(argc, argv, "+d:e:")) >= 0; ) {
-            switch (opt) {
-            case 'd':
-                debug_shell = optarg;
-                break;
-
-            case 'e':
-                entropy_port = atoi(optarg);
-                if (entropy_port == 0) {
-                    fputs("invalid entropy port\n", stderr);
-                    exit(1);
-                }
-
-                break;
-
-            default:
-                exit(1);
-            }
-        }
-    }
-
-    char **child_argv = argv + optind;
-    int child_argc = argc - optind;
-
     // Block all signals in init. SIGCHLD will still cause wait() to return.
     sigset_t set;
     sigfillset(&set);
     sigprocmask(SIG_BLOCK, &set, 0);
 
+    printf("init_rlimit\n");
     init_rlimit();
+
+    printf("init_dev\n");
     init_dev();
+
+    printf("init_fs\n");
     init_fs(ops, sizeof(ops) / sizeof(ops[0]));
+    
+    printf("init_cgroups\n");
     init_cgroups();
+
+    printf("init network inet4\n");
     init_network("lo", AF_INET);
-    init_network("lo", AF_INET6);
-    if (entropy_port != 0) {
-        init_entropy(entropy_port);
-    }
 
-    pid_t pid = launch(child_argc, child_argv);
-    if (debug_shell != NULL) {
-        // The debug shell takes over as the primary child.
-        pid = launch(1, &debug_shell);
-    }
-
-    // Reap until the initial child process dies.
-    return reap_until(pid);
+    printf("done with all init \n");
+    return 0;
 }
